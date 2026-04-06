@@ -1,0 +1,31 @@
+﻿Physics Basics
+
+Newton's First Law:
+An object will remain at rest or in uniform motion unless acted upon by an external force.
+
+Newton's Second Law:
+Force equals mass times acceleration (F = ma). It explains how the velocity of an object changes when a force is applied.
+
+Newton's Third Law:
+For every action, there is an equal and opposite reaction.
+
+Speed vs Velocity:
+Speed is a scalar quantity (only magnitude), while velocity is a vector quantity (magnitude + direction).
+
+Work:
+Work is done when a force moves an object over a distance. Work = Force x Distance.
+
+Energy:
+Energy is the ability to do work. It exists in different forms such as kinetic energy and potential energy.
+
+Kinetic Energy:
+Energy possessed by an object due to its motion. Formula: KE = 1/2 mv2
+
+Potential Energy:
+Stored energy based on position or height. Formula: PE = mgh
+
+Power:
+Power is the rate of doing work. Power = Work / Time
+
+Gravity:
+Gravity is the force that attracts objects toward the Earth. The acceleration due to gravity is approximately 9.8 m/s2.

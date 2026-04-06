@@ -1,0 +1,12 @@
+"Build a clean, complete, copy-paste ready Local RAG project using FastAPI, PostgreSQL + pgvector (via Docker on port 5433), Async SQLAlchemy, asyncpg, and 100% free offline embeddings using sentence-transformers (specifically all-MiniLM-L6-v2).
+
+Please generate the full project structure including:
+
+docker-compose.yml (using pgvector/pgvector:pg16 image on port 5433)
+requirements.txt
+.env (pointing to localhost:5433)
+app/config.py, app/db.py, app/models.py (with Vector(384))
+app/rag.py (using local SentenceTransformer model)
+app/main.py (with a GET /query endpoint that correctly casts the vector string)
+seed.py
+Write all the files, and then immediately run the commands to auto-setup the Python virtual environment, install dependencies, spin up the Docker container, and run the vector extension creation command."
