@@ -8,3 +8,5 @@ pgvector==0.4.2
 python-multipart==0.0.22
 streamlit==1.56.0
 requests==2.33.1
+PyMuPDF
+python-docx

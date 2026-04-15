@@ -1,189 +1,199 @@
 """
-Simple Streamlit frontend for Local RAG Chatbot
-Talks to FastAPI backend at http://localhost:8000
-Run: streamlit run streamlit_app.py
+Simple Streamlit frontend for the hybrid RAG app.
+Run with: streamlit run streamlit_app.py
 """
+
+import time
 
 import requests
 import streamlit as st
-import time
+
 
 BACKEND = "http://localhost:8000"
 
-st.set_page_config(page_title="RAG Chatbot", page_icon="🤖")
+st.set_page_config(page_title="Hybrid RAG", page_icon="RAG")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def get_api(path: str):
+    try:
+        response = requests.get(f"{BACKEND}{path}", timeout=10)
+        return response.json(), response.ok
+    except Exception as exc:
+        return {"detail": str(exc)}, False
+
+
+def post_api(path: str, json_payload=None, files=None, timeout: int = 60):
+    try:
+        response = requests.post(
+            f"{BACKEND}{path}",
+            json=json_payload,
+            files=files,
+            timeout=timeout,
+        )
+        return response.json(), response.ok
+    except Exception as exc:
+        return {"detail": str(exc)}, False
+
 
 def get_stats():
-    try:
-        r = requests.get(f"{BACKEND}/stats", timeout=5)
-        return r.json() if r.ok else None
-    except Exception:
-        return None
+    return get_api("/stats")
 
 
-def upload_file(file_bytes, filename):
-    try:
-        r = requests.post(
-            f"{BACKEND}/upload",
-            files={"file": (filename, file_bytes)},
-            timeout=60,
+def get_documents():
+    return get_api("/documents")
+
+
+def upload_files(uploaded_files):
+    files = [
+        (
+            "files",
+            (
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+                uploaded_file.type or "application/octet-stream",
+            ),
         )
-        return r.json(), r.ok
-    except Exception as e:
-        return {"detail": str(e)}, False
+        for uploaded_file in uploaded_files
+    ]
+    return post_api("/upload", files=files, timeout=180)
 
 
 def ask_question(question: str):
-    try:
-        r = requests.get(f"{BACKEND}/query", params={"q": question}, timeout=30)
-        return r.json(), r.ok
-    except Exception as e:
-        return {"detail": str(e)}, False
+    return post_api("/query", json_payload={"question": question}, timeout=60)
 
 
 def reset_knowledge():
-    try:
-        r = requests.post(f"{BACKEND}/reset", timeout=10)
-        return r.ok
-    except Exception:
-        return False
+    return post_api("/reset", timeout=30)
 
 
-# ── Session state ─────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
-    st.session_state.messages = []   # [{"role": "user"|"assistant", "content": "..."}]
-if "query_latencies_ms" not in st.session_state:
-    st.session_state.query_latencies_ms = []
-if "last_upload_latency_ms" not in st.session_state:
-    st.session_state.last_upload_latency_ms = None
-if "last_query_latency_ms" not in st.session_state:
-    st.session_state.last_query_latency_ms = None
+    st.session_state.messages = []
+if "last_query_ms" not in st.session_state:
+    st.session_state.last_query_ms = None
+if "last_upload_ms" not in st.session_state:
+    st.session_state.last_upload_ms = None
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+stats, stats_ok = get_stats()
+documents_payload, documents_ok = get_documents()
+
 with st.sidebar:
-    st.title("🤖 RAG Chatbot")
+    st.title("Hybrid RAG")
 
-    stats = get_stats()
-    if stats:
-        st.metric("Chunks Indexed", stats.get("knowledge_rows", 0))
-        db_target = stats.get("database_target", {})
-        if db_target:
-            st.caption(
-                f"DB: {db_target.get('host')}:{db_target.get('port')} / {db_target.get('database')}"
-            )
+    if stats_ok:
+        st.metric("Documents", stats.get("document_count", 0))
+        st.metric("Chunks", stats.get("chunk_count", 0))
     else:
-        st.error("⚠️ Backend offline — start uvicorn first.")
+        st.error("Backend is offline. Start FastAPI first.")
 
     st.divider()
-    st.subheader("⏱️ Latency (Real-Time)")
-    if st.session_state.last_upload_latency_ms is not None:
-        st.write(f"Upload: {st.session_state.last_upload_latency_ms:.2f} ms")
-    if st.session_state.last_query_latency_ms is not None:
-        st.write(f"Query: {st.session_state.last_query_latency_ms:.2f} ms")
-
-    recent = st.session_state.query_latencies_ms[-10:]
-    if recent:
-        avg_ms = sum(recent) / len(recent)
-        sorted_recent = sorted(recent)
-        p95_idx = int(round(0.95 * (len(sorted_recent) - 1)))
-        p95_ms = sorted_recent[p95_idx]
-        st.caption(f"Last 10 queries: {len(recent)}")
-        st.caption(f"Avg: {avg_ms:.2f} ms")
-        st.caption(f"P95: {p95_ms:.2f} ms")
-    if st.button("Reset Latency Stats"):
-        st.session_state.query_latencies_ms = []
-        st.session_state.last_upload_latency_ms = None
-        st.session_state.last_query_latency_ms = None
-        st.rerun()
-
-    st.divider()
-
-    st.subheader("📂 Upload Knowledge")
-    uploaded = st.file_uploader(
-        "Choose a file (.txt, .md, .csv, .json)",
-        type=["txt", "md", "csv", "json"],
+    st.subheader("Upload Files")
+    uploaded_files = st.file_uploader(
+        "Upload .pdf, .txt, or .docx files",
+        type=["pdf", "txt", "docx"],
+        accept_multiple_files=True,
     )
-    if uploaded and st.button("Index File", type="primary"):
-        with st.spinner("Indexing…"):
-            start = time.perf_counter()
-            result, ok = upload_file(uploaded.read(), uploaded.name)
-            upload_latency_ms = (time.perf_counter() - start) * 1000
-            st.session_state.last_upload_latency_ms = upload_latency_ms
-        if ok and result.get("chunks_indexed"):
-            st.success(
-                f"Indexed {result['chunks_indexed']} chunks from `{uploaded.name}`"
-                f" (total rows: {result.get('knowledge_rows', 'n/a')})"
-            )
-            st.info(f"Upload latency: {upload_latency_ms:.2f} ms")
+    if uploaded_files and st.button("Index Files", type="primary"):
+        start = time.perf_counter()
+        result, ok = upload_files(uploaded_files)
+        st.session_state.last_upload_ms = (time.perf_counter() - start) * 1000
+
+        if ok:
+            st.success(f"Indexed {result.get('uploaded_count', 0)} file(s).")
+            for item in result.get("errors", []):
+                st.warning(f"{item['filename']}: {item['error']}")
             st.rerun()
         else:
-            st.error(result.get("detail") or result.get("message") or str(result))
+            st.error(result.get("detail", "Upload failed."))
 
     st.divider()
+    st.subheader("Recent Files")
+    if documents_ok and documents_payload.get("documents"):
+        for document in documents_payload["documents"][:10]:
+            st.caption(f"{document['filename']} | {document['chunk_count']} chunks")
+    else:
+        st.caption("No files uploaded yet.")
 
-    if st.button("🗑️ Clear All Knowledge"):
-        if reset_knowledge():
+    st.divider()
+    if st.button("Reset Knowledge"):
+        _, ok = reset_knowledge()
+        if ok:
             st.session_state.messages = []
-            st.success("Knowledge cleared.")
+            st.success("Knowledge reset.")
             st.rerun()
         else:
             st.error("Reset failed.")
 
-    if st.button("🧹 Clear Chat History"):
+    if st.button("Clear Chat"):
         st.session_state.messages = []
         st.rerun()
 
-# ── Main chat area ────────────────────────────────────────────────────────────
-st.title("💬 Ask Your Knowledge Base")
+    if st.session_state.last_upload_ms is not None:
+        st.caption(f"Last upload: {st.session_state.last_upload_ms:.2f} ms")
+    if st.session_state.last_query_ms is not None:
+        st.caption(f"Last query: {st.session_state.last_query_ms:.2f} ms")
 
-if not stats:
-    st.warning("Backend is not reachable. Make sure uvicorn is running.")
-elif stats.get("knowledge_rows", 0) == 0:
-    st.info("No knowledge indexed yet. Upload a file in the sidebar first.")
 
-# Render chat history using native st.chat_message
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
-        if msg.get("source"):
-            st.caption(f"📄 Source: {msg['source']}")
+st.title("Ask Your Files")
 
-# Chat input
-question = st.chat_input("Ask a question…")
+if not stats_ok:
+    st.warning("Backend is not reachable.")
+elif stats.get("document_count", 0) == 0:
+    st.info("Upload files first, then ask questions.")
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+        filenames = message.get("filenames")
+        if filenames:
+            st.caption(f"Filenames: {', '.join(filenames)}")
+        sources = message.get("sources")
+        if sources:
+            with st.expander("Show source chunks"):
+                for source in sources:
+                    st.markdown(f"**{source['filename']}**")
+                    st.write(source["content"])
+
+
+question = st.chat_input("Ask a question about your uploaded files")
 if question:
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.write(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching…"):
-            start = time.perf_counter()
-            result, ok = ask_question(question)
-            query_latency_ms = (time.perf_counter() - start) * 1000
-            st.session_state.last_query_latency_ms = query_latency_ms
-            st.session_state.query_latencies_ms.append(query_latency_ms)
-            st.session_state.query_latencies_ms = st.session_state.query_latencies_ms[-100:]
+        start = time.perf_counter()
+        result, ok = ask_question(question)
+        st.session_state.last_query_ms = (time.perf_counter() - start) * 1000
 
-        if ok and result.get("answer"):
-            answer = result["answer"]
-            source = result.get("topic", "")
-            source_chunk = result.get("source_chunk", "")
-            st.write(answer)
-            st.caption(f"⏱️ Query latency: {query_latency_ms:.2f} ms")
-            if source:
-                st.caption(f"📄 Source: {source}")
-            if source_chunk:
-                with st.expander("Show retrieved chunk"):
-                    st.write(source_chunk)
+        if ok:
+            st.write(result.get("answer", "No answer returned."))
+            filenames = result.get("filenames", [])
+            if filenames:
+                st.caption(f"Filenames: {', '.join(filenames)}")
+            retrieval = result.get("retrieval", {})
+            if retrieval:
+                st.caption(
+                    f"Vector mode: {retrieval.get('vector_mode', 'unknown')} | "
+                    f"Chunks indexed: {retrieval.get('chunk_count', 0)}"
+                )
+            sources = result.get("sources", [])
+            if sources:
+                with st.expander("Show source chunks"):
+                    for source in sources:
+                        st.markdown(f"**{source['filename']}**")
+                        st.write(source["content"])
             st.session_state.messages.append(
-                {"role": "assistant", "content": answer, "source": source}
+                {
+                    "role": "assistant",
+                    "content": result.get("answer", ""),
+                    "filenames": filenames,
+                    "sources": sources,
+                }
             )
-        elif ok and result.get("message"):
-            msg_text = f"{result['message']} — {result.get('hint', '')}"
-            st.warning(msg_text)
-            st.session_state.messages.append({"role": "assistant", "content": msg_text})
         else:
-            err = f"Error: {result.get('detail', 'Unknown error')}"
-            st.error(err)
-            st.session_state.messages.append({"role": "assistant", "content": err})
+            error_message = result.get("detail", "Query failed.")
+            st.error(error_message)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": error_message}
+            )
