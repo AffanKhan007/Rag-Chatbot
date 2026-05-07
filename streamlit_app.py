@@ -3,13 +3,17 @@ Simple Streamlit frontend for the hybrid RAG app.
 Run with: streamlit run streamlit_app.py
 """
 
+import os
 import time
 
 import requests
 import streamlit as st
+from dotenv import load_dotenv
 
 
 BACKEND = "http://localhost:8000"
+load_dotenv()
+SERVICE_API_KEY = os.getenv("SERVICE_API_KEY")
 
 st.set_page_config(page_title="Hybrid RAG", page_icon="RAG")
 
@@ -24,10 +28,14 @@ def get_api(path: str):
 
 def post_api(path: str, json_payload=None, files=None, timeout: int = 60):
     try:
+        headers = {}
+        if SERVICE_API_KEY:
+            headers["X-API-Key"] = SERVICE_API_KEY
         response = requests.post(
             f"{BACKEND}{path}",
             json=json_payload,
             files=files,
+            headers=headers,
             timeout=timeout,
         )
         return response.json(), response.ok

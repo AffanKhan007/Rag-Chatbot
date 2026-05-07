@@ -1,5 +1,7 @@
 import asyncio
 import io
+import json
+import logging
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -10,10 +12,12 @@ from urllib.parse import urlparse
 import fitz
 import requests
 from docx import Document as DocxDocument
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, insert, select, text
 
 from app.config import (
+    ALLOWED_ORIGINS,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     DATABASE_URL,
@@ -28,18 +32,20 @@ from app.config import (
     HNSW_EF_SEARCH,
     KEYWORD_TOP_K,
     RERANK_TOP_K,
+    SERVICE_API_KEY,
     USE_HNSW_FOR_LARGE_DATA,
     VECTOR_TOP_K,
 )
 from app.db import SessionLocal, engine
 from app.models import Base, Chunk, DocumentRecord, Workspace
 from app.rag import ensure_models_loaded, get_embedding, get_embeddings_batch, rerank_candidates
-from app.schemas import QueryRequest
+from app.schemas import AskDocsResponse, QueryRequest
 
 
 @dataclass
 class RetrievedChunk:
     chunk_id: int
+    chunk_index: int | None
     document_id: int
     workspace_id: int
     filename: str
@@ -55,6 +61,20 @@ class RetrievalMode:
     use_hnsw: bool
     chunk_count: int
     mode_label: str
+
+
+default_workspace_id_cache: int | None = None
+logger = logging.getLogger("rag_backend")
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
+
+def _log_event(event: str, **fields: object) -> None:
+    logger.info("%s | %s", event, json.dumps(fields, default=str, ensure_ascii=True))
 
 
 async def initialize_database() -> None:
@@ -97,8 +117,13 @@ async def ensure_default_workspace() -> Workspace:
 
 
 async def get_default_workspace_id() -> int:
+    global default_workspace_id_cache
+    if default_workspace_id_cache is not None:
+        return default_workspace_id_cache
+
     workspace = await ensure_default_workspace()
-    return workspace.id
+    default_workspace_id_cache = workspace.id
+    return default_workspace_id_cache
 
 
 @asynccontextmanager
@@ -114,6 +139,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def _db_target() -> dict[str, str | int | None]:
     parsed = urlparse(DATABASE_URL)
@@ -122,6 +155,100 @@ def _db_target() -> dict[str, str | int | None]:
         "port": parsed.port,
         "database": (parsed.path or "").lstrip("/") or None,
     }
+
+
+def _service_mode_label() -> str:
+    if ENABLE_RERANK and ENABLE_GROQ_GENERATION:
+        return "ask_docs_rerank_groq"
+    if ENABLE_RERANK:
+        return "ask_docs_rerank_local"
+    if ENABLE_GROQ_GENERATION:
+        return "ask_docs_groq"
+    return "ask_docs_local"
+
+
+async def verify_service_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    if not SERVICE_API_KEY:
+        return
+    if x_api_key != SERVICE_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header.")
+
+
+def _normalize_document_ids(document_ids: list[int] | None) -> list[int] | None:
+    if not document_ids:
+        return None
+    normalized = sorted({int(document_id) for document_id in document_ids if int(document_id) > 0})
+    return normalized or None
+
+
+def _request_metadata(request: Request, x_client_app: str | None) -> dict[str, object]:
+    return {
+        "client_app": x_client_app or request.headers.get("x-client-source") or "unknown",
+        "client_host": request.client.host if request.client else None,
+        "origin": request.headers.get("origin"),
+        "user_agent": request.headers.get("user-agent"),
+        "method": request.method,
+        "path": request.url.path,
+    }
+
+
+async def get_documents_for_scope(
+    workspace_id: int,
+    document_ids: list[int] | None,
+) -> list[DocumentRecord]:
+    async with SessionLocal() as db:
+        query = (
+            select(DocumentRecord)
+            .where(DocumentRecord.workspace_id == workspace_id)
+            .order_by(DocumentRecord.created_at.desc(), DocumentRecord.id.desc())
+        )
+        if document_ids:
+            query = query.where(DocumentRecord.id.in_(document_ids))
+        result = await db.execute(query)
+        documents = result.scalars().all()
+
+    if document_ids:
+        found_ids = {document.id for document in documents}
+        missing_ids = [document_id for document_id in document_ids if document_id not in found_ids]
+        if missing_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Document IDs not found in the available scope: {missing_ids}",
+            )
+
+    return documents
+
+
+def _document_debug_items(documents: list[DocumentRecord]) -> list[dict[str, object]]:
+    return [
+        {
+            "document_id": document.id,
+            "filename": document.filename,
+            "file_type": document.file_type,
+            "chunk_count": document.chunk_count,
+            "created_at": document.created_at.isoformat() if document.created_at else None,
+        }
+        for document in documents
+    ]
+
+
+def _chunk_debug_items(chunks: list[RetrievedChunk], include_content: bool = True) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for chunk in chunks:
+        item = {
+            "chunk_id": chunk.chunk_id,
+            "chunk_index": chunk.chunk_index,
+            "document_id": chunk.document_id,
+            "filename": chunk.filename,
+            "vector_score": chunk.vector_score,
+            "keyword_score": chunk.keyword_score,
+            "merged_score": chunk.merged_score,
+            "rerank_score": chunk.rerank_score,
+        }
+        if include_content:
+            item["content"] = chunk.content
+        items.append(item)
+    return items
 
 
 def _normalize_text(raw_text: str) -> str:
@@ -347,11 +474,12 @@ def merge_candidates(
     )
 
 
-async def get_total_chunk_count(workspace_id: int) -> int:
+async def get_total_chunk_count(workspace_id: int, document_ids: list[int] | None = None) -> int:
     async with SessionLocal() as db:
-        chunk_count = await db.scalar(
-            select(func.count()).select_from(Chunk).where(Chunk.workspace_id == workspace_id)
-        )
+        query = select(func.count()).select_from(Chunk).where(Chunk.workspace_id == workspace_id)
+        if document_ids:
+            query = query.where(Chunk.document_id.in_(document_ids))
+        chunk_count = await db.scalar(query)
     return int(chunk_count or 0)
 
 
@@ -368,8 +496,9 @@ async def vector_retrieval(
     workspace_id: int,
     question_embedding: list[float],
     limit: int,
+    document_ids: list[int] | None = None,
 ) -> tuple[list[RetrievedChunk], RetrievalMode]:
-    chunk_count = await get_total_chunk_count(workspace_id)
+    chunk_count = await get_total_chunk_count(workspace_id, document_ids)
     retrieval_mode = choose_vector_retrieval_mode(chunk_count)
 
     async with SessionLocal() as db:
@@ -380,33 +509,37 @@ async def vector_retrieval(
             await db.execute(text("SET LOCAL enable_bitmapscan = off"))
             await db.execute(text("SET LOCAL enable_indexonlyscan = off"))
 
-        result = await db.execute(
-            text(
-                """
-                SELECT
-                    id AS chunk_id,
-                    document_id,
-                    workspace_id,
-                    filename,
-                    content,
-                    1 - (embedding <=> CAST(:embedding AS vector)) AS vector_score
-                FROM chunks
-                WHERE workspace_id = :workspace_id
-                ORDER BY embedding <=> CAST(:embedding AS vector)
-                LIMIT :limit
-                """
-            ),
-            {
-                "workspace_id": workspace_id,
-                "embedding": str(question_embedding),
-                "limit": limit,
-            },
-        )
+        query_text = """
+            SELECT
+                id AS chunk_id,
+                chunk_index,
+                document_id,
+                workspace_id,
+                filename,
+                content,
+                1 - (embedding <=> CAST(:embedding AS vector)) AS vector_score
+            FROM chunks
+            WHERE workspace_id = :workspace_id
+        """
+        params: dict[str, object] = {
+            "workspace_id": workspace_id,
+            "embedding": str(question_embedding),
+            "limit": limit,
+        }
+        if document_ids:
+            query_text += " AND document_id = ANY(CAST(:document_ids AS int[]))"
+            params["document_ids"] = document_ids
+        query_text += """
+            ORDER BY embedding <=> CAST(:embedding AS vector)
+            LIMIT :limit
+        """
+        result = await db.execute(text(query_text), params)
         rows = result.mappings().all()
 
     return ([
         RetrievedChunk(
             chunk_id=row["chunk_id"],
+            chunk_index=row["chunk_index"],
             document_id=row["document_id"],
             workspace_id=row["workspace_id"],
             filename=row["filename"],
@@ -417,39 +550,48 @@ async def vector_retrieval(
     ], retrieval_mode)
 
 
-async def keyword_retrieval(workspace_id: int, question: str, limit: int) -> list[RetrievedChunk]:
+async def keyword_retrieval(
+    workspace_id: int,
+    question: str,
+    limit: int,
+    document_ids: list[int] | None = None,
+) -> list[RetrievedChunk]:
     async with SessionLocal() as db:
-        result = await db.execute(
-            text(
-                """
-                WITH query AS (
-                    SELECT websearch_to_tsquery('english', :question) AS q
-                )
-                SELECT
-                    c.id AS chunk_id,
-                    c.document_id,
-                    c.workspace_id,
-                    c.filename,
-                    c.content,
-                    ts_rank_cd(c.tsv, query.q) AS keyword_score
-                FROM chunks c, query
-                WHERE c.workspace_id = :workspace_id
-                  AND query.q @@ c.tsv
-                ORDER BY keyword_score DESC, c.id ASC
-                LIMIT :limit
-                """
-            ),
-            {
-                "workspace_id": workspace_id,
-                "question": question,
-                "limit": limit,
-            },
-        )
+        query_text = """
+            WITH query AS (
+                SELECT websearch_to_tsquery('english', :question) AS q
+            )
+            SELECT
+                c.id AS chunk_id,
+                c.chunk_index,
+                c.document_id,
+                c.workspace_id,
+                c.filename,
+                c.content,
+                ts_rank_cd(c.tsv, query.q) AS keyword_score
+            FROM chunks c, query
+            WHERE c.workspace_id = :workspace_id
+              AND query.q @@ c.tsv
+        """
+        params: dict[str, object] = {
+            "workspace_id": workspace_id,
+            "question": question,
+            "limit": limit,
+        }
+        if document_ids:
+            query_text += " AND c.document_id = ANY(CAST(:document_ids AS int[]))"
+            params["document_ids"] = document_ids
+        query_text += """
+            ORDER BY keyword_score DESC, c.id ASC
+            LIMIT :limit
+        """
+        result = await db.execute(text(query_text), params)
         rows = result.mappings().all()
 
     return [
         RetrievedChunk(
             chunk_id=row["chunk_id"],
+            chunk_index=row["chunk_index"],
             document_id=row["document_id"],
             workspace_id=row["workspace_id"],
             filename=row["filename"],
@@ -534,18 +676,42 @@ def home():
     return {
         "message": "Hybrid RAG API is running",
         "docs": "/docs",
-        "endpoints": ["/upload", "/documents", "/query", "/stats", "/reset"],
+        "endpoints": ["/upload", "/documents", "/query", "/ask-docs", "/health", "/ready", "/stats", "/reset"],
     }
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "rag_chatbot"}
+
+
+@app.get("/ready")
+async def ready():
+    workspace_id = await get_default_workspace_id()
+    return {"status": "ready", "default_workspace_id": workspace_id}
+
+
 @app.post("/upload")
-async def upload_files(files: list[UploadFile] = File(...)):
+async def upload_files(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    x_client_app: str | None = Header(default=None),
+    _: None = Depends(verify_service_api_key),
+):
     if not files:
         raise HTTPException(status_code=400, detail="At least one file is required.")
 
     workspace_id = await get_default_workspace_id()
     successes: list[dict[str, int | str]] = []
     errors: list[dict[str, str]] = []
+    request_meta = _request_metadata(request, x_client_app)
+
+    _log_event(
+        "upload_request_received",
+        request=request_meta,
+        file_names=[upload.filename or "unnamed" for upload in files],
+        workspace_id=workspace_id,
+    )
 
     async with SessionLocal() as db:
         for upload in files:
@@ -587,7 +753,13 @@ async def upload_files(files: list[UploadFile] = File(...)):
                     {
                         "filename": filename,
                         "document_id": document.id,
+                        "stored": True,
+                        "text_extracted_chars": len(extracted_text),
+                        "chunks_created": len(chunks),
+                        "embeddings_created": len(embeddings),
                         "chunks_indexed": len(chunks),
+                        "vector_indexed": True,
+                        "full_text_indexed": True,
                     }
                 )
             except ValueError as exc:
@@ -603,10 +775,35 @@ async def upload_files(files: list[UploadFile] = File(...)):
         document_count = await db.scalar(select(func.count()).select_from(DocumentRecord))
         chunk_count = await db.scalar(select(func.count()).select_from(Chunk))
 
+    _log_event(
+        "upload_request_completed",
+        request=request_meta,
+        uploaded_count=len(successes),
+        failed_count=len(errors),
+        document_count=int(document_count or 0),
+        chunk_count=int(chunk_count or 0),
+        processed_files=successes,
+        errors=errors,
+    )
+
     return {
         "uploaded_count": len(successes),
         "failed_count": len(errors),
         "processed_files": successes,
+        "document_ids": [
+            int(item["document_id"])
+            for item in successes
+            if "document_id" in item
+        ],
+        "documents": [
+            {
+                "document_id": int(item["document_id"]),
+                "filename": str(item["filename"]),
+                "chunks_indexed": int(item["chunks_indexed"]),
+            }
+            for item in successes
+            if "document_id" in item
+        ],
         "errors": errors,
         "document_count": int(document_count or 0),
         "chunk_count": int(chunk_count or 0),
@@ -636,7 +833,7 @@ async def list_documents():
 
 
 @app.post("/reset")
-async def reset_knowledge():
+async def reset_knowledge(_: None = Depends(verify_service_api_key)):
     async with SessionLocal() as db:
         await db.execute(text("TRUNCATE TABLE chunks, documents RESTART IDENTITY CASCADE;"))
         await db.commit()
@@ -660,23 +857,45 @@ async def stats():
     }
 
 
-@app.post("/query")
-async def query(payload: QueryRequest):
+async def execute_query(
+    payload: QueryRequest,
+    request: Request,
+    x_client_app: str | None = None,
+) -> dict[str, object]:
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question is required.")
 
     workspace_id = await get_default_workspace_id()
-    question_embedding = await get_embedding(question)
+    normalized_document_ids = _normalize_document_ids(payload.document_ids)
+    scope_documents = await get_documents_for_scope(workspace_id, normalized_document_ids)
+    scope_document_ids = [document.id for document in scope_documents]
+    request_meta = _request_metadata(request, x_client_app)
+
+    _log_event(
+        "query_request_received",
+        request=request_meta,
+        question=question,
+        requested_document_ids=normalized_document_ids,
+        searched_document_ids=scope_document_ids,
+        searched_filenames=[document.filename for document in scope_documents],
+        debug=payload.debug,
+    )
+
+    question_embedding, keyword_hits = await asyncio.gather(
+        get_embedding(question),
+        keyword_retrieval(
+            workspace_id,
+            question,
+            payload.keyword_top_k or KEYWORD_TOP_K,
+            scope_document_ids if normalized_document_ids else None,
+        ),
+    )
     vector_hits, retrieval_mode = await vector_retrieval(
         workspace_id,
         question_embedding,
         payload.vector_top_k or VECTOR_TOP_K,
-    )
-    keyword_hits = await keyword_retrieval(
-        workspace_id,
-        question,
-        payload.keyword_top_k or KEYWORD_TOP_K,
+        scope_document_ids if normalized_document_ids else None,
     )
     merged_hits = merge_candidates(vector_hits, keyword_hits)
 
@@ -696,6 +915,36 @@ async def query(payload: QueryRequest):
     final_limit = payload.final_top_k or (RERANK_TOP_K if ENABLE_RERANK else FINAL_CONTEXT_K)
     final_chunks = merged_hits[:final_limit]
     answer, filenames, groq_error = await build_grounded_answer(question, final_chunks)
+    debug_payload = {
+        "request": {
+            "question": question,
+            "requested_document_ids": normalized_document_ids or [],
+        },
+        "client": request_meta,
+        "searched_documents": _document_debug_items(scope_documents),
+        "candidate_chunks": {
+            "vector": _chunk_debug_items(vector_hits, include_content=False),
+            "keyword": _chunk_debug_items(keyword_hits, include_content=False),
+            "merged": _chunk_debug_items(merged_hits, include_content=False),
+            "selected": _chunk_debug_items(final_chunks, include_content=True),
+        },
+        "retrieved_context": [chunk.content for chunk in final_chunks],
+    }
+
+    _log_event(
+        "query_request_completed",
+        request=request_meta,
+        question=question,
+        answer=answer,
+        searched_document_ids=scope_document_ids,
+        selected_chunk_ids=[chunk.chunk_id for chunk in final_chunks],
+        selected_documents=sorted({chunk.document_id for chunk in final_chunks}),
+        filenames=filenames,
+        vector_hits=len(vector_hits),
+        keyword_hits=len(keyword_hits),
+        merged_hits=len(merged_hits),
+        groq_error=groq_error,
+    )
 
     return {
         "question": question,
@@ -708,10 +957,14 @@ async def query(payload: QueryRequest):
             "keyword_hits": len(keyword_hits),
             "merged_hits": len(merged_hits),
             "hnsw_threshold": HNSW_CHUNK_THRESHOLD,
+            "requested_document_ids": normalized_document_ids or [],
+            "searched_document_ids": scope_document_ids,
+            "searched_document_count": len(scope_documents),
         },
         "sources": [
             {
                 "chunk_id": item.chunk_id,
+                "chunk_index": item.chunk_index,
                 "document_id": item.document_id,
                 "filename": item.filename,
                 "content": item.content,
@@ -722,4 +975,34 @@ async def query(payload: QueryRequest):
             for item in final_chunks
         ],
         "groq_error": groq_error,
+        "debug": debug_payload if payload.debug else None,
     }
+
+
+@app.post("/query")
+async def query(
+    request: Request,
+    payload: QueryRequest,
+    x_client_app: str | None = Header(default=None),
+    _: None = Depends(verify_service_api_key),
+):
+    return await execute_query(payload, request, x_client_app)
+
+
+@app.post("/ask-docs", response_model=AskDocsResponse)
+async def ask_docs(
+    request: Request,
+    payload: QueryRequest,
+    x_client_app: str | None = Header(default=None),
+    _: None = Depends(verify_service_api_key),
+):
+    result = await execute_query(payload, request, x_client_app)
+    return AskDocsResponse(
+        question=result["question"],
+        answer=result["answer"],
+        filenames=result["filenames"],
+        found_in_documents=result["answer"].strip().lower() != "not found in the uploaded documents",
+        mode=_service_mode_label(),
+        groq_error=result["groq_error"],
+        debug=result["debug"],
+    )
