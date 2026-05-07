@@ -1,5 +1,14 @@
 # Hybrid RAG Backend
 
+[![Status](https://img.shields.io/badge/status-active%20development-2563eb)](https://github.com/)
+[![Backend](https://img.shields.io/badge/backend-FastAPI%20%2B%20PostgreSQL%20%2B%20pgvector-0f172a)](https://fastapi.tiangolo.com/)
+[![Frontend](https://img.shields.io/badge/frontend-Streamlit-111827)](https://streamlit.io/)
+[![Database](https://img.shields.io/badge/database-PostgreSQL%2016%20%2B%20pgvector-0ea5e9)](https://www.postgresql.org/)
+[![Embeddings](https://img.shields.io/badge/embeddings-all--MiniLM--L6--v2-7c3aed)](https://www.sbert.net/)
+[![RAG](https://img.shields.io/badge/RAG-hybrid%20retrieval-9333ea)](#architecture)
+[![Python](https://img.shields.io/badge/made%20with-Python-3776ab)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-not%20specified-64748b)](#summary)
+
 A production-style hybrid Retrieval-Augmented Generation (RAG) backend built with **FastAPI**, **PostgreSQL + pgvector**, and **Streamlit**. The system ingests uploaded documents, extracts and chunks their text, stores vector embeddings and full-text indexes in PostgreSQL, and answers questions using a hybrid retrieval pipeline.
 
 This project also exposes a clean HTTP API so it can be consumed by another application such as **EchoPanel**.
